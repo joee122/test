@@ -10,3 +10,8 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
+
+# Ollama LLM settings
+ollama:
+  url: http://localhost:11434
+  model: llama2
