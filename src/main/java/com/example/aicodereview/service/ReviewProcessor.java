@@ -6,12 +6,15 @@ import com.example.aicodereview.mapper.ProjectMapper;
 import com.example.aicodereview.mapper.ReviewMapper;
 import org.apache.commons.io.FileUtils;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
 import java.io.IOException;
+import java.time.LocalDateTime;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
 public class ReviewProcessor {
@@ -22,29 +25,39 @@ public class ReviewProcessor {
     private final GitCloneService gitCloneService;
     private final ProjectMapper projectMapper;
 
-    public ReviewProcessor(ReviewMapper reviewMapper, StaticAnalyzer staticAnalyzer, OllamaClient ollamaClient, GitCloneService gitCloneService, ProjectMapper projectMapper) {
+    // clone defaults (injected from application.yml)
+    private final int cloneDepth;
+    private final long cloneTimeoutSeconds;
+    private final int cloneRetries;
+
+    public ReviewProcessor(ReviewMapper reviewMapper, StaticAnalyzer staticAnalyzer, OllamaClient ollamaClient, GitCloneService gitCloneService, ProjectMapper projectMapper,
+                           @Value("${clone.depth:1}") int cloneDepth,
+                           @Value("${clone.timeoutSeconds:120}") long cloneTimeoutSeconds,
+                           @Value("${clone.retries:3}") int cloneRetries) {
         this.reviewMapper = reviewMapper;
         this.staticAnalyzer = staticAnalyzer;
         this.ollamaClient = ollamaClient;
         this.gitCloneService = gitCloneService;
         this.projectMapper = projectMapper;
+        this.cloneDepth = cloneDepth;
+        this.cloneTimeoutSeconds = cloneTimeoutSeconds;
+        this.cloneRetries = cloneRetries;
     }
 
     @Async("reviewTaskExecutor")
     public void processReviewAsync(Long reviewId, String gitUrl, String commitId) {
         File tmpDir = null;
         try {
-            // create temp dir
             tmpDir = new File(System.getProperty("java.io.tmpdir"), "repo-" + UUID.randomUUID());
             tmpDir.mkdirs();
 
-            // try to lookup project to get credentials (best effort)
+            // lookup project for credentials
             Project project = projectMapper.selectById(getProjectIdFromReview(reviewId));
             String username = project != null ? project.getGitUsername() : null;
             String token = project != null ? project.getGitToken() : null;
 
-            // clone with shallow depth, timeout and retries
-            gitCloneService.cloneRepository(gitUrl, tmpDir, username, token, 1, 120, 3);
+            // perform clone using configured defaults
+            gitCloneService.cloneRepository(gitUrl, tmpDir, username, token, cloneDepth, cloneTimeoutSeconds, cloneRetries);
 
             // checkout commit if provided
             if (commitId != null && !commitId.isBlank()) {
@@ -57,20 +70,45 @@ public class ReviewProcessor {
             // run static analysis
             String summary = staticAnalyzer.analyzeDirectory(tmpDir);
 
-            // prompt to Ollama
-            String prompt = "You are an AI code review assistant. Given the following static analysis summary, provide concise, prioritized action items and specific suggestions developers can follow.\n\n"
-                    + summary + "\n\nRespond with bullet points and brief explanations.";
+            // prepare initial resultSummary and mark as RUNNING
+            Review start = new Review();
+            start.setId(reviewId);
+            start.setResultSummary("Static analysis:\n" + summary + "\n\nLLM suggestions:\n");
+            start.setStatus("RUNNING");
+            reviewMapper.updateById(start);
 
-            String ollamaResult = ollamaClient.generate(prompt);
+            // stream from Ollama and append to resultSummary as chunks arrive
+            AtomicBoolean hadError = new AtomicBoolean(false);
+            ollamaClient.streamGenerate(buildPrompt(summary), chunk -> {
+                try {
+                    // append chunk to current resultSummary
+                    Review r = reviewMapper.selectById(reviewId);
+                    String prev = r != null && r.getResultSummary() != null ? r.getResultSummary() : "";
+                    String updated = prev + chunk;
+                    Review update = new Review();
+                    update.setId(reviewId);
+                    update.setResultSummary(updated);
+                    update.setStatus("RUNNING");
+                    update.setCreatedAt(r != null ? r.getCreatedAt() : LocalDateTime.now());
+                    reviewMapper.updateById(update);
+                } catch (Exception e) {
+                    hadError.set(true);
+                }
+            });
 
-            String combined = "Static analysis:\n" + summary + "\n\nLLM suggestions:\n" + ollamaResult;
-
-            // update review
-            Review r = new Review();
-            r.setId(reviewId);
-            r.setResultSummary(combined);
-            r.setStatus("DONE");
-            reviewMapper.updateById(r);
+            if (hadError.get()) {
+                Review r = new Review();
+                r.setId(reviewId);
+                r.setStatus("FAILED");
+                r.setResultSummary("Ollama streaming error (see logs)");
+                reviewMapper.updateById(r);
+            } else {
+                // mark DONE
+                Review r = new Review();
+                r.setId(reviewId);
+                r.setStatus("DONE");
+                reviewMapper.updateById(r);
+            }
 
         } catch (Exception e) {
             Review r = new Review();
@@ -86,6 +124,10 @@ public class ReviewProcessor {
                 }
             }
         }
+    }
+
+    private String buildPrompt(String summary) {
+        return "You are an AI code review assistant. Given the following static analysis summary, provide concise, prioritized action items and specific suggestions developers can follow.\n\n" + summary + "\n\nRespond with bullet points and brief explanations.";
     }
 
     private Long getProjectIdFromReview(Long reviewId) {

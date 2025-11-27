@@ -15,3 +15,9 @@ mybatis-plus:
 ollama:
   url: http://localhost:11434
   model: llama2
+
+# Clone defaults (shallow clone / timeout / retries)
+clone:
+  depth: 1
+  timeoutSeconds: 120
+  retries: 3
